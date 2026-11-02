@@ -8,9 +8,9 @@ Behavior:
 - Remains running after the batch finishes so Render sees a healthy web service.
 
 IMPORTANT:
-- Upload progress and Telegram topic mappings are stored in Neon PostgreSQL.
+- Each topic name has its own local SQLite progress file and matching Neon database.
+- Local SQLite is written first; Neon is restored/synchronised with retries.
 - Downloaded media remains temporary in /tmp and is removed after upload.
-- Do not commit credentials to GitHub. Set them in Render Environment.
 """
 
 import os
@@ -18,16 +18,17 @@ import re
 import json
 import asyncio
 import sqlite3
+import time
 from contextlib import contextmanager
+from urllib.parse import urlsplit, urlunsplit, quote
 
 import psycopg2
-from psycopg2.pool import ThreadedConnectionPool
+from psycopg2 import sql
 import subprocess
 import base64
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from datetime import datetime
-from urllib.parse import urlparse
 
 import aiohttp
 import aiofiles
@@ -76,13 +77,25 @@ SKIP_ALREADY_DONE_BY_THIS_TOOL = env_bool("SKIP_ALREADY_DONE_BY_THIS_TOOL", True
 
 # Downloads remain temporary; upload history and topic mappings live in Neon.
 TEMP_DIR = os.getenv("TEMP_DIR", "/tmp/pd_to_tg_temp")
-DATABASE_URL = (
-    os.getenv("DATABASE_URL_POOLED", "").strip()
-    or os.getenv("DATABASE_URL", "").strip()
-)
+PROGRESS_DIR = os.getenv("PROGRESS_DIR", "/tmp/pd_to_tg_tracking")
+DATABASE_URL_POOLED = os.getenv("DATABASE_URL_POOLED", "").strip()
+DATABASE_URL_DIRECT = os.getenv("DATABASE_URL", "").strip()
+# Prefer Neon pooled connections for ordinary queries; use the direct URL to
+# provision a per-topic PostgreSQL database when needed.
+DATABASE_URL = DATABASE_URL_POOLED or DATABASE_URL_DIRECT
 os.makedirs(TEMP_DIR, exist_ok=True)
+os.makedirs(PROGRESS_DIR, exist_ok=True)
 
-_db_pool = None
+# These are selected after the source list title has been loaded. The names
+# deliberately follow the original Colab naming convention exactly.
+ACTIVE_USERNAME = "unknown"
+ACTIVE_DB_NAME = "unknown_pd_to_tg_progress"
+ACTIVE_DB_PATH = os.path.join(PROGRESS_DIR, "unknown_pd_to_tg_progress.db")
+ACTIVE_NEON_URL = ""
+ACTIVE_NEON_DATABASE_READY = False
+ACTIVE_NEON_TABLES_READY = False
+ACTIVE_NEON_RESTORE_DONE = False
+LOCAL_NEON_DIRTY = False
 
 
 def validate_config():
@@ -104,139 +117,419 @@ def validate_config():
 
 
 # ============================================================
-# PROGRESS TRACKING — Neon PostgreSQL (persistent external storage)
+# PROGRESS TRACKING — original per-topic SQLite + matching Neon database
 # ============================================================
 
-def get_db_pool():
-    global _db_pool
-    if _db_pool is None:
-        if not DATABASE_URL:
-            raise RuntimeError("Set DATABASE_URL_POOLED or DATABASE_URL in Render")
-        _db_pool = ThreadedConnectionPool(
-            minconn=1,
-            maxconn=4,
-            dsn=DATABASE_URL,
-            connect_timeout=15,
-            application_name="pixeldrain-telegram-uploader",
-        )
-    return _db_pool
+def clean_progress_username(username):
+    clean = "".join(c for c in str(username) if c.isalnum() or c in ("-", "_"))
+    clean = clean.strip().lower() or "unknown"
+    return clean
 
 
-@contextmanager
-def db_connection():
-    pool = get_db_pool()
-    conn = pool.getconn()
-    discard = False
+def _database_url_for_name(base_url, database_name):
+    parts = urlsplit(base_url)
+    return urlunsplit((parts.scheme, parts.netloc, "/" + quote(database_name), parts.query, parts.fragment))
+
+
+def _local_connection():
+    conn = sqlite3.connect(ACTIVE_DB_PATH, timeout=30)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=30000")
+    return conn
+
+
+def _neon_connect():
+    if not ACTIVE_NEON_URL:
+        raise RuntimeError("Neon database URL has not been selected")
+    # Always create a fresh connection. If Neon or the network has closed an
+    # earlier connection, the next attempt establishes a new TCP connection.
+    return psycopg2.connect(
+        ACTIVE_NEON_URL,
+        connect_timeout=15,
+        application_name="pixeldrain-telegram-uploader",
+        keepalives=1,
+        keepalives_idle=30,
+        keepalives_interval=10,
+        keepalives_count=3,
+    )
+
+
+def _with_neon_retry(operation, label="Neon operation"):
+    if not ACTIVE_NEON_URL:
+        return False
+    last_error = None
+    for attempt in range(1, 4):
+        conn = None
+        try:
+            conn = _neon_connect()
+            result = operation(conn)
+            conn.commit()
+            return result if result is not None else True
+        except Exception as exc:
+            last_error = exc
+            if conn is not None:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+            print(f"{label} attempt {attempt}/3 failed: {type(exc).__name__}: {exc}", flush=True)
+            if attempt < 3:
+                time.sleep(attempt * 2)
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+    print(f"{label} deferred; local SQLite remains authoritative. Last error: {last_error}", flush=True)
+    return False
+
+
+def _provision_neon_database(database_name):
+    """Create a real PostgreSQL database matching this topic's SQLite file."""
+    admin_url = DATABASE_URL_DIRECT or DATABASE_URL_POOLED
+    if not admin_url:
+        print("No Neon connection string configured; using local SQLite only.", flush=True)
+        return False
+    admin_url = _database_url_for_name(admin_url, "neondb")
+    conn = None
     try:
-        yield conn
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        discard = bool(conn.closed)
-        raise
+        conn = psycopg2.connect(admin_url, connect_timeout=20, application_name="pd-tg-db-provisioner")
+        conn.autocommit = True
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1 FROM pg_database WHERE datname = %s", (database_name,))
+            exists = cur.fetchone() is not None
+            if not exists:
+                cur.execute(sql.SQL("CREATE DATABASE {}").format(sql.Identifier(database_name)))
+                print(f"Created Neon database: {database_name}", flush=True)
+            else:
+                print(f"Neon database already exists: {database_name}", flush=True)
+        return True
+    except Exception as exc:
+        # A concurrent Render service may have created it between the check
+        # and CREATE DATABASE. Re-check once before treating it as unavailable.
+        try:
+            if conn is not None:
+                conn.close()
+                conn = None
+            check = psycopg2.connect(admin_url, connect_timeout=15)
+            try:
+                with check.cursor() as cur:
+                    cur.execute("SELECT 1 FROM pg_database WHERE datname = %s", (database_name,))
+                    if cur.fetchone():
+                        return True
+            finally:
+                check.close()
+        except Exception:
+            pass
+        print(f"Could not provision Neon database {database_name}: {type(exc).__name__}: {exc}", flush=True)
+        print("The uploader will continue with its local SQLite database; Neon sync will retry.", flush=True)
+        return False
     finally:
-        pool.putconn(conn, close=discard)
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
 
-def init_progress_db(username=None):
-    # One shared table replaces the old per-username SQLite files.
-    with db_connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS progress (
-                    pixeldrain_id TEXT NOT NULL,
-                    filename TEXT,
-                    service TEXT,
-                    username TEXT NOT NULL,
-                    status TEXT DEFAULT 'pending',
-                    local_path TEXT,
-                    error TEXT,
-                    updated_at TIMESTAMPTZ,
-                    PRIMARY KEY (username, pixeldrain_id)
-                )
-            """)
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS topic_map (
-                    destination_chat_id BIGINT NOT NULL,
-                    topic_name TEXT NOT NULL,
-                    topic_id BIGINT NOT NULL,
-                    updated_at TIMESTAMPTZ DEFAULT NOW(),
-                    PRIMARY KEY (destination_chat_id, topic_name)
-                )
-            """)
-
-
-def get_progress(username, pd_id):
-    with db_connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                "SELECT status, filename, error FROM progress "
-                "WHERE username = %s AND pixeldrain_id = %s",
-                (username, pd_id),
+def _init_local_tables():
+    with _local_connection() as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS progress (
+                pixeldrain_id TEXT PRIMARY KEY,
+                filename TEXT,
+                service TEXT,
+                username TEXT,
+                status TEXT DEFAULT 'pending',
+                local_path TEXT,
+                error TEXT,
+                updated_at TEXT
             )
-            return cur.fetchone()
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS topic_map (
+                destination_chat_id INTEGER NOT NULL,
+                topic_name TEXT NOT NULL,
+                topic_id INTEGER NOT NULL,
+                updated_at TEXT,
+                PRIMARY KEY (destination_chat_id, topic_name)
+            )
+        """)
 
 
-def mark_progress(username, pd_id, status, filename=None, service=None,
-                  local_path=None, error=None):
-    now = datetime.now().astimezone()
-    with db_connection() as conn:
+def _init_neon_tables(conn):
+    with conn.cursor() as cur:
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS progress (
+                pixeldrain_id TEXT PRIMARY KEY,
+                filename TEXT,
+                service TEXT,
+                username TEXT,
+                status TEXT DEFAULT 'pending',
+                local_path TEXT,
+                error TEXT,
+                updated_at TEXT
+            )
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS topic_map (
+                destination_chat_id BIGINT NOT NULL,
+                topic_name TEXT NOT NULL,
+                topic_id BIGINT NOT NULL,
+                updated_at TEXT,
+                PRIMARY KEY (destination_chat_id, topic_name)
+            )
+        """)
+
+
+def _neon_upsert_progress(row):
+    def write(conn):
         with conn.cursor() as cur:
             cur.execute("""
                 INSERT INTO progress
                     (pixeldrain_id, filename, service, username, status,
                      local_path, error, updated_at)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-                ON CONFLICT (username, pixeldrain_id) DO UPDATE SET
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
+                ON CONFLICT (pixeldrain_id) DO UPDATE SET
                     status = EXCLUDED.status,
                     filename = COALESCE(EXCLUDED.filename, progress.filename),
                     service = COALESCE(EXCLUDED.service, progress.service),
+                    username = COALESCE(EXCLUDED.username, progress.username),
                     local_path = EXCLUDED.local_path,
                     error = EXCLUDED.error,
                     updated_at = EXCLUDED.updated_at
-            """, (pd_id, filename, service, username, status,
-                  local_path, error, now))
+            """, tuple(row[key] for key in (
+                "pixeldrain_id", "filename", "service", "username", "status",
+                "local_path", "error", "updated_at"
+            )))
+    return _with_neon_retry(write, "Neon progress sync")
+
+
+def sync_all_local_to_neon():
+    """Mirror the complete local progress DB in one retryable Neon transaction."""
+    global ACTIVE_NEON_DATABASE_READY, ACTIVE_NEON_TABLES_READY, ACTIVE_NEON_RESTORE_DONE
+    global LOCAL_NEON_DIRTY
+    if not ACTIVE_NEON_URL:
+        return False
+    # Also recover if Neon database creation or table initialization failed at
+    # startup while the service was temporarily unable to reach Neon.
+    if not ACTIVE_NEON_DATABASE_READY:
+        ACTIVE_NEON_DATABASE_READY = _provision_neon_database(ACTIVE_DB_NAME)
+        if not ACTIVE_NEON_DATABASE_READY:
+            return False
+    if not ACTIVE_NEON_TABLES_READY:
+        ACTIVE_NEON_TABLES_READY = bool(
+            _with_neon_retry(_init_neon_tables, "Neon table initialization retry")
+        )
+        if not ACTIVE_NEON_TABLES_READY:
+            return False
+    if not ACTIVE_NEON_RESTORE_DONE:
+        ACTIVE_NEON_RESTORE_DONE = _restore_neon_to_local()
+        if not ACTIVE_NEON_RESTORE_DONE:
+            return False
+    with _local_connection() as conn:
+        rows = conn.execute("SELECT * FROM progress").fetchall()
+    values = [tuple(row[key] for key in (
+        "pixeldrain_id", "filename", "service", "username", "status",
+        "local_path", "error", "updated_at"
+    )) for row in rows]
+
+    def write_batch(conn):
+        with conn.cursor() as cur:
+            cur.executemany("""
+                INSERT INTO progress
+                    (pixeldrain_id, filename, service, username, status,
+                     local_path, error, updated_at)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
+                ON CONFLICT (pixeldrain_id) DO UPDATE SET
+                    status = EXCLUDED.status,
+                    filename = COALESCE(EXCLUDED.filename, progress.filename),
+                    service = COALESCE(EXCLUDED.service, progress.service),
+                    username = COALESCE(EXCLUDED.username, progress.username),
+                    local_path = EXCLUDED.local_path,
+                    error = EXCLUDED.error,
+                    updated_at = EXCLUDED.updated_at
+            """, values)
+    progress_ok = (
+        bool(_with_neon_retry(write_batch, "Neon batch sync"))
+        if values else True
+    )
+
+    with _local_connection() as conn:
+        topic_rows = conn.execute("SELECT * FROM topic_map").fetchall()
+    if topic_rows:
+        topic_values = [tuple(row[key] for key in (
+            "destination_chat_id", "topic_name", "topic_id", "updated_at"
+        )) for row in topic_rows]
+        def write_topics(conn):
+            with conn.cursor() as cur:
+                cur.executemany("""
+                    INSERT INTO topic_map
+                        (destination_chat_id, topic_name, topic_id, updated_at)
+                    VALUES (%s,%s,%s,%s)
+                    ON CONFLICT (destination_chat_id, topic_name) DO UPDATE SET
+                        topic_id=EXCLUDED.topic_id,
+                        updated_at=EXCLUDED.updated_at
+                """, topic_values)
+        topics_ok = bool(_with_neon_retry(write_topics, "Neon topic-map sync"))
+    else:
+        topics_ok = True
+    all_ok = progress_ok and topics_ok
+    if all_ok:
+        LOCAL_NEON_DIRTY = False
+    return all_ok
+
+
+def _restore_neon_to_local():
+    if not ACTIVE_NEON_URL:
+        return False
+    def read(conn):
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT pixeldrain_id, filename, service, username, status,
+                       local_path, error, updated_at FROM progress
+            """)
+            return cur.fetchall()
+    rows = _with_neon_retry(read, "Neon progress restore")
+    if rows is False:
+        return False
+    def read_topics(conn):
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT destination_chat_id, topic_name, topic_id, updated_at
+                FROM topic_map
+            """)
+            return cur.fetchall()
+    topic_rows = _with_neon_retry(read_topics, "Neon topic-map restore")
+    if topic_rows is False:
+        return False
+    with _local_connection() as conn:
+        for row in rows or []:
+            conn.execute("""
+                INSERT INTO progress
+                    (pixeldrain_id, filename, service, username, status,
+                     local_path, error, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(pixeldrain_id) DO NOTHING
+            """, row)
+        for row in topic_rows:
+            conn.execute("""
+                INSERT INTO topic_map
+                    (destination_chat_id, topic_name, topic_id, updated_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(destination_chat_id, topic_name) DO NOTHING
+            """, row)
+    return True
+
+
+def init_progress_db(username=None):
+    global ACTIVE_NEON_TABLES_READY, ACTIVE_NEON_RESTORE_DONE
+    _init_local_tables()
+    if ACTIVE_NEON_URL:
+        ACTIVE_NEON_TABLES_READY = bool(
+            _with_neon_retry(_init_neon_tables, "Neon table initialization")
+        )
+        if ACTIVE_NEON_TABLES_READY:
+            ACTIVE_NEON_RESTORE_DONE = _restore_neon_to_local()
+            # Push any local rows left unsynchronised by a previous outage.
+            if ACTIVE_NEON_RESTORE_DONE:
+                sync_all_local_to_neon()
+
+
+def get_progress(username, pd_id):
+    with _local_connection() as conn:
+        row = conn.execute(
+            "SELECT status, filename, error FROM progress WHERE pixeldrain_id=?",
+            (pd_id,),
+        ).fetchone()
+    return tuple(row) if row else None
+
+
+def mark_progress(username, pd_id, status, filename=None, service=None,
+                  local_path=None, error=None):
+    now = datetime.now().astimezone().isoformat()
+    # Commit locally first. A Neon outage cannot interrupt the actual upload.
+    with _local_connection() as conn:
+        conn.execute("""
+            INSERT INTO progress
+                (pixeldrain_id, filename, service, username, status,
+                 local_path, error, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(pixeldrain_id) DO UPDATE SET
+                status=excluded.status,
+                filename=COALESCE(excluded.filename, progress.filename),
+                service=COALESCE(excluded.service, progress.service),
+                username=COALESCE(excluded.username, progress.username),
+                local_path=excluded.local_path,
+                error=excluded.error,
+                updated_at=excluded.updated_at
+        """, (pd_id, filename, service, username, status, local_path, error, now))
+    global LOCAL_NEON_DIRTY
+    LOCAL_NEON_DIRTY = True
 
 
 def print_progress_summary(username):
-    with db_connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                "SELECT status, COUNT(*) FROM progress "
-                "WHERE username = %s GROUP BY status ORDER BY status",
-                (username,),
-            )
-            rows = cur.fetchall()
+    with _local_connection() as conn:
+        rows = conn.execute(
+            "SELECT status, COUNT(*) FROM progress GROUP BY status ORDER BY status"
+        ).fetchall()
     if not rows:
-        print(f"Progress tracking for [{username}] is empty", flush=True)
+        print(f"Progress DB for {username} is empty", flush=True)
         return
-    print(f"Progress tracking for [{username}] (Neon PostgreSQL):", flush=True)
+    print(f"Progress tracking for [{username}]", flush=True)
     for status, count in rows:
-        print(f"  {status}: {count}", flush=True)
+        print(f"   {status}: {count}", flush=True)
+
+
+def get_user_progress_db(username):
+    return ACTIVE_DB_PATH
 
 
 def get_saved_topic_id(chat_id, topic_name):
-    with db_connection() as conn:
+    with _local_connection() as conn:
+        row = conn.execute(
+            "SELECT topic_id FROM topic_map WHERE destination_chat_id=? AND LOWER(topic_name)=LOWER(?)",
+            (chat_id, topic_name),
+        ).fetchone()
+    if row:
+        return row[0]
+    if not ACTIVE_NEON_URL:
+        return None
+    def read(conn):
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT topic_id FROM topic_map "
-                "WHERE destination_chat_id = %s AND LOWER(topic_name) = LOWER(%s)",
+                "SELECT topic_id FROM topic_map WHERE destination_chat_id=%s AND LOWER(topic_name)=LOWER(%s)",
                 (chat_id, topic_name),
             )
-            row = cur.fetchone()
-            return row[0] if row else None
+            result = cur.fetchone()
+            return result[0] if result else None
+    result = _with_neon_retry(read, "Neon topic lookup")
+    return result if result is not False else None
 
 
 def save_topic_id(chat_id, topic_name, topic_id):
-    with db_connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute("""
-                INSERT INTO topic_map (destination_chat_id, topic_name, topic_id)
-                VALUES (%s, %s, %s)
-                ON CONFLICT (destination_chat_id, topic_name) DO UPDATE SET
-                    topic_id = EXCLUDED.topic_id,
-                    updated_at = NOW()
-            """, (chat_id, topic_name, topic_id))
+    now = datetime.now().astimezone().isoformat()
+    with _local_connection() as conn:
+        conn.execute("""
+            INSERT INTO topic_map (destination_chat_id, topic_name, topic_id, updated_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(destination_chat_id, topic_name) DO UPDATE SET
+                topic_id=excluded.topic_id, updated_at=excluded.updated_at
+        """, (chat_id, topic_name, topic_id, now))
+    global LOCAL_NEON_DIRTY
+    LOCAL_NEON_DIRTY = True
+    if ACTIVE_NEON_URL:
+        def write(conn):
+            with conn.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO topic_map (destination_chat_id, topic_name, topic_id, updated_at)
+                    VALUES (%s, %s, %s, %s)
+                    ON CONFLICT (destination_chat_id, topic_name) DO UPDATE SET
+                        topic_id=EXCLUDED.topic_id, updated_at=EXCLUDED.updated_at
+                """, (chat_id, topic_name, topic_id, now))
+        _with_neon_retry(write, "Neon topic sync")
 
 
 # ============================================================
@@ -751,6 +1044,26 @@ async def main():
     else:
         raise RuntimeError("Provide PIXELDRAIN_LIST_URL or SOURCE_DB_OR_JSON")
 
+    global ACTIVE_USERNAME, ACTIVE_DB_NAME, ACTIVE_DB_PATH, ACTIVE_NEON_URL
+    global ACTIVE_NEON_DATABASE_READY, ACTIVE_NEON_TABLES_READY, ACTIVE_NEON_RESTORE_DONE
+    global LOCAL_NEON_DIRTY
+    ACTIVE_USERNAME = clean_progress_username(active_username)
+    # Match the Colab filename convention: <clean username>_pd_to_tg_progress.db
+    ACTIVE_DB_NAME = f"{ACTIVE_USERNAME}_pd_to_tg_progress"
+    ACTIVE_DB_PATH = os.path.join(PROGRESS_DIR, f"{ACTIVE_DB_NAME}.db")
+    if DATABASE_URL:
+        # Use the direct endpoint for database-specific connections when it is
+        # available; fall back to the pooler only if the direct URL is absent.
+        neon_base_url = DATABASE_URL_DIRECT or DATABASE_URL_POOLED
+        ACTIVE_NEON_URL = _database_url_for_name(neon_base_url, ACTIVE_DB_NAME)
+        ACTIVE_NEON_DATABASE_READY = _provision_neon_database(ACTIVE_DB_NAME)
+        ACTIVE_NEON_TABLES_READY = False
+        ACTIVE_NEON_RESTORE_DONE = False
+    LOCAL_NEON_DIRTY = False
+    print(f"Progress database name: {ACTIVE_DB_NAME}", flush=True)
+    print(f"Local progress DB: {ACTIVE_DB_PATH}", flush=True)
+    print(f"Neon database: {ACTIVE_DB_NAME}", flush=True)
+
     init_progress_db(active_username)
     print_progress_summary(active_username)
     print(f"Total files available: {len(files)}", flush=True)
@@ -786,13 +1099,15 @@ async def main():
 
         ok_count = sum(1 for result in results if result)
         fail_count = len(results) - ok_count
+        print("Flushing local progress to Neon...", flush=True)
+        await asyncio.to_thread(sync_all_local_to_neon)
 
         print("\n" + "=" * 60, flush=True)
         print("BATCH DONE", flush=True)
         print(f"Success: {ok_count}", flush=True)
         print(f"Failed : {fail_count}", flush=True)
         print_progress_summary(active_username)
-        print(f"Progress DB (temporary): {get_user_progress_db(active_username)}", flush=True)
+        print(f"Per-list progress DB: {get_user_progress_db(active_username)}", flush=True)
         print("=" * 60, flush=True)
     finally:
         await client.disconnect()
@@ -831,6 +1146,22 @@ def start_health_server():
 
 async def service():
     start_health_server()
+
+    async def periodic_neon_sync():
+        while True:
+            await asyncio.sleep(20)
+            try:
+                if ACTIVE_NEON_URL and (
+                    LOCAL_NEON_DIRTY
+                    or not ACTIVE_NEON_DATABASE_READY
+                    or not ACTIVE_NEON_TABLES_READY
+                    or not ACTIVE_NEON_RESTORE_DONE
+                ):
+                    await asyncio.to_thread(sync_all_local_to_neon)
+            except Exception as exc:
+                print(f"Periodic Neon sync will retry: {type(exc).__name__}: {exc}", flush=True)
+
+    asyncio.create_task(periodic_neon_sync())
 
     # Start the batch exactly once per process start. If it fails, log the
     # exception but keep the HTTP service alive so Render can report health.
