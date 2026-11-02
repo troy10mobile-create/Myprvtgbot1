@@ -22,9 +22,11 @@ from contextlib import contextmanager
 
 import psycopg2
 from psycopg2.pool import ThreadedConnectionPool
+from psycopg2 import OperationalError, InterfaceError
 import subprocess
 import base64
 import threading
+import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from datetime import datetime
 from urllib.parse import urlparse
@@ -52,8 +54,10 @@ def env_bool(name, default=False):
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 SOURCE_DB_OR_JSON = os.getenv("SOURCE_DB_OR_JSON", "").strip()
+# An explicitly supplied local DB/JSON takes precedence over the fallback list.
 PIXELDRAIN_LIST_URL = os.getenv(
-    "PIXELDRAIN_LIST_URL", "https://pixeldrain.com/l/M2YSA2M1"
+    "PIXELDRAIN_LIST_URL",
+    "" if SOURCE_DB_OR_JSON else "https://pixeldrain.com/l/M2YSA2M1",
 ).strip()
 
 MAX_FILES_TO_PROCESS = env_int("MAX_FILES_TO_PROCESS", 0)
@@ -83,6 +87,7 @@ DATABASE_URL = (
 os.makedirs(TEMP_DIR, exist_ok=True)
 
 _db_pool = None
+_db_pool_lock = threading.RLock()
 
 
 def validate_config():
@@ -108,34 +113,78 @@ def validate_config():
 # ============================================================
 
 def get_db_pool():
+    """Create the shared Neon pool lazily and safely across threads."""
     global _db_pool
-    if _db_pool is None:
-        if not DATABASE_URL:
-            raise RuntimeError("Set DATABASE_URL_POOLED or DATABASE_URL in Render")
-        _db_pool = ThreadedConnectionPool(
-            minconn=1,
-            maxconn=4,
-            dsn=DATABASE_URL,
-            connect_timeout=15,
-            application_name="pixeldrain-telegram-uploader",
-        )
-    return _db_pool
+    with _db_pool_lock:
+        if _db_pool is None or getattr(_db_pool, "closed", False):
+            if not DATABASE_URL:
+                raise RuntimeError("Set DATABASE_URL_POOLED or DATABASE_URL in Render")
+            _db_pool = ThreadedConnectionPool(
+                minconn=1,
+                maxconn=4,
+                dsn=DATABASE_URL,
+                connect_timeout=15,
+                application_name="pixeldrain-telegram-uploader",
+                keepalives=1,
+                keepalives_idle=30,
+                keepalives_interval=10,
+                keepalives_count=3,
+            )
+        return _db_pool
 
 
 @contextmanager
 def db_connection():
+    """Borrow a live connection; discard stale/broken connections safely."""
     pool = get_db_pool()
-    conn = pool.getconn()
+    conn = None
     discard = False
     try:
-        yield conn
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        discard = bool(conn.closed)
-        raise
+        # A pooled connection may have been closed by Neon/PgBouncer while idle.
+        for attempt in range(2):
+            conn = pool.getconn()
+            try:
+                if conn.closed:
+                    raise InterfaceError("pooled PostgreSQL connection is closed")
+                with conn.cursor() as cur:
+                    cur.execute("SELECT 1")
+                conn.commit()
+                break
+            except (OperationalError, InterfaceError):
+                try:
+                    pool.putconn(conn, close=True)
+                except Exception:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+                conn = None
+                if attempt:
+                    raise
+        if conn is None:
+            raise OperationalError("Could not obtain a live PostgreSQL connection")
+
+        try:
+            yield conn
+            conn.commit()
+        except Exception as exc:
+            try:
+                if not conn.closed:
+                    conn.rollback()
+            except Exception:
+                discard = True
+            if conn.closed or isinstance(exc, (OperationalError, InterfaceError)):
+                discard = True
+            raise
     finally:
-        pool.putconn(conn, close=discard)
+        if conn is not None:
+            try:
+                pool.putconn(conn, close=(discard or bool(conn.closed)))
+            except Exception:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
 
 
 def init_progress_db(username=None):
@@ -391,7 +440,6 @@ async def load_from_pixeldrain_list(list_url_or_id: str):
 # ============================================================
 
 BYPASS_MIRRORS = [
-    "https://cdn.pixeldrain.eu.cc/{id}?download",
     "https://cdn.pixeldrain.eu.cc/{id}?download",
 ]
 OFFICIAL_URL = "https://pixeldrain.com/api/file/{id}?download"
@@ -792,7 +840,7 @@ async def main():
         print(f"Success: {ok_count}", flush=True)
         print(f"Failed : {fail_count}", flush=True)
         print_progress_summary(active_username)
-        print(f"Progress DB (temporary): {get_user_progress_db(active_username)}", flush=True)
+        print("Progress DB: Neon PostgreSQL", flush=True)
         print("=" * 60, flush=True)
     finally:
         await client.disconnect()
@@ -839,6 +887,7 @@ async def service():
             await main()
         except Exception as exc:
             print(f"FATAL batch error: {type(exc).__name__}: {exc}", flush=True)
+            traceback.print_exc()
 
     asyncio.create_task(run_batch())
 
