@@ -1,25 +1,21 @@
 """
 Pixeldrain -> Telegram batch uploader, adapted from the user's working Colab script.
-
 Behavior:
 - Processes the configured Pixeldrain list (or optional local DB/JSON) once at startup.
 - Keeps the original download/topic/progress/upload workflow.
 - Exposes a tiny HTTP health endpoint for Render.
 - Remains running after the batch finishes so Render sees a healthy web service.
-
 IMPORTANT:
 - Upload progress and Telegram topic mappings are stored in Neon PostgreSQL.
 - Downloaded media remains temporary in /tmp and is removed after upload.
 - Do not commit credentials to GitHub. Set them in Render Environment.
 """
-
 import os
 import re
 import json
 import asyncio
 import sqlite3
 from contextlib import contextmanager
-
 import psycopg2
 from psycopg2.pool import ThreadedConnectionPool
 from psycopg2 import OperationalError, InterfaceError
@@ -30,7 +26,6 @@ import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from datetime import datetime
 from urllib.parse import urlparse
-
 import aiohttp
 import aiofiles
 from telethon import TelegramClient
@@ -42,10 +37,10 @@ from aiofasttelethonhelper import fast_upload
 # ============================================================
 # CONFIGURATION — set these in Render > Environment
 # ============================================================
-
 def env_int(name, default):
     value = os.getenv(name)
     return int(value) if value not in (None, "") else default
+
 
 def env_bool(name, default=False):
     value = os.getenv(name)
@@ -53,31 +48,26 @@ def env_bool(name, default=False):
         return default
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
+
 SOURCE_DB_OR_JSON = os.getenv("SOURCE_DB_OR_JSON", "").strip()
 # An explicitly supplied local DB/JSON takes precedence over the fallback list.
 PIXELDRAIN_LIST_URL = os.getenv(
     "PIXELDRAIN_LIST_URL",
     "" if SOURCE_DB_OR_JSON else "https://pixeldrain.com/l/M2YSA2M1",
 ).strip()
-
 MAX_FILES_TO_PROCESS = env_int("MAX_FILES_TO_PROCESS", 0)
 FILTER_USERNAME = os.getenv("FILTER_USERNAME", "").strip()
 FILTER_SERVICE = os.getenv("FILTER_SERVICE", "").strip()
-
 PIXELDRAIN_API_KEY = os.getenv("PIXELDRAIN_API_KEY", "").strip()
-
 api_id = env_int("TG_API_ID", 0)
 api_hash = os.getenv("TG_API_HASH", "").strip()
 BOT_TOKEN = os.getenv("TG_BOT_TOKEN", "").strip()
 DESTINATION_CHAT_ID = env_int("DESTINATION_CHAT_ID", 0)
-
 # You said not to worry about session persistence. This path is ephemeral.
 SESSION_FILE_NAME = os.getenv("SESSION_FILE_NAME", "/tmp/telegram_bot.session")
-
 MAX_TELEGRAM_SIZE = 1900 * 1024 * 1024
 DOWNLOAD_WORKERS = env_int("DOWNLOAD_WORKERS", 2)
 SKIP_ALREADY_DONE_BY_THIS_TOOL = env_bool("SKIP_ALREADY_DONE_BY_THIS_TOOL", True)
-
 # Downloads remain temporary; upload history and topic mappings live in Neon.
 TEMP_DIR = os.getenv("TEMP_DIR", "/tmp/pd_to_tg_temp")
 DATABASE_URL = (
@@ -85,7 +75,6 @@ DATABASE_URL = (
     or os.getenv("DATABASE_URL", "").strip()
 )
 os.makedirs(TEMP_DIR, exist_ok=True)
-
 _db_pool = None
 _db_pool_lock = threading.RLock()
 
@@ -111,7 +100,6 @@ def validate_config():
 # ============================================================
 # PROGRESS TRACKING — Neon PostgreSQL (persistent external storage)
 # ============================================================
-
 def get_db_pool():
     """Create the shared Neon pool lazily and safely across threads."""
     global _db_pool
@@ -163,7 +151,6 @@ def db_connection():
                     raise
         if conn is None:
             raise OperationalError("Could not obtain a live PostgreSQL connection")
-
         try:
             yield conn
             conn.commit()
@@ -291,7 +278,6 @@ def save_topic_id(chat_id, topic_name, topic_id):
 # ============================================================
 # SMART TOPIC EXTRACTION FROM LIST TITLE
 # ============================================================
-
 def topic_from_list_title(title: str) -> str:
     if not title:
         return "unknown"
@@ -315,7 +301,6 @@ def topic_from_list_title(title: str) -> str:
 # ============================================================
 # LOAD FROM DB / JSON
 # ============================================================
-
 def load_from_db_or_json(source_path):
     files = []
     if source_path.lower().endswith(".json"):
@@ -367,7 +352,6 @@ def load_from_db_or_json(source_path):
 # ============================================================
 # PIXELDRAIN LIST
 # ============================================================
-
 def _pd_auth_header():
     if not PIXELDRAIN_API_KEY:
         return {}
@@ -389,13 +373,11 @@ async def load_from_pixeldrain_list(list_url_or_id: str):
     list_id = extract_list_id(list_url_or_id)
     if not list_id:
         raise ValueError("Could not extract Pixeldrain list ID")
-
     url = f"https://pixeldrain.com/api/list/{list_id}"
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
         **_pd_auth_header(),
     }
-
     timeout = aiohttp.ClientTimeout(total=90, sock_connect=20, sock_read=60)
     async with aiohttp.ClientSession(headers=headers, timeout=timeout) as sess:
         async with sess.get(url) as resp:
@@ -403,12 +385,10 @@ async def load_from_pixeldrain_list(list_url_or_id: str):
                 body = await resp.text()
                 raise RuntimeError(f"List API failed ({resp.status}): {body[:200]}")
             data = await resp.json()
-
     list_title = data.get("title") or ""
     topic_name = topic_from_list_title(list_title)
     print(f"List title : {list_title}", flush=True)
     print(f"Topic name : {topic_name}", flush=True)
-
     files = []
     for item in data.get("files") or []:
         pd_id = item.get("id")
@@ -430,15 +410,77 @@ async def load_from_pixeldrain_list(list_url_or_id: str):
             "username": topic_name,
             "force_official": force_official,
         })
-
     print(f"Loaded {len(files)} files from list {list_id}", flush=True)
     return files, topic_name
 
 
 # ============================================================
+# PIXELDRAIN GRAB / DELETE (temporary copy only)
+# ============================================================
+async def grab_file(pd_id: str) -> str | None:
+    """Create a temporary copy. Returns new ID or None."""
+    if not PIXELDRAIN_API_KEY:
+        return None
+    url = "https://pixeldrain.com/api/file"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        **_pd_auth_header(),
+    }
+    data = aiohttp.FormData()
+    data.add_field("grab_file", pd_id)
+    timeout = aiohttp.ClientTimeout(total=60, sock_connect=15, sock_read=30)
+    try:
+        async with aiohttp.ClientSession(headers=headers, timeout=timeout) as sess:
+            async with sess.post(url, data=data) as resp:
+                if resp.status != 201:
+                    return None
+                result = await resp.json()
+                return result.get("id")
+    except Exception:
+        return None
+
+
+async def delete_file(pd_id: str) -> None:
+    """Delete the temporary copy we own. Silent on failure."""
+    if not PIXELDRAIN_API_KEY or not pd_id:
+        return
+    url = f"https://pixeldrain.com/api/file/{pd_id}"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        **_pd_auth_header(),
+    }
+    timeout = aiohttp.ClientTimeout(total=30, sock_connect=10, sock_read=20)
+    try:
+        async with aiohttp.ClientSession(headers=headers, timeout=timeout) as sess:
+            async with sess.delete(url) as resp:
+                pass  # we don't care about the result
+    except Exception:
+        pass
+
+
+RESTRICTED_MARKERS = (
+    "file_rate_limited_captcha_required",
+    "virus_detected_captcha_required",
+    "hotlink_detected",
+    "ip_download_limited_captcha_required",
+    "server_overload_captcha_required",
+    "max_concurrent_downloads",
+    "transfer_limit_exceeded",
+    "download_limit_exceeded",
+    "403",
+)
+
+
+def is_restricted_error(err: str | None) -> bool:
+    if not err:
+        return False
+    err = err.lower()
+    return any(m in err for m in RESTRICTED_MARKERS)
+
+
+# ============================================================
 # PIXELDRAIN DOWNLOAD
 # ============================================================
-
 BYPASS_MIRRORS = [
     "https://cdn.pixeldrain.eu.cc/{id}?download",
 ]
@@ -451,17 +493,14 @@ async def download_from_pixeldrain(pd_id: str, local_path: str,
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
         **_pd_auth_header(),
     }
-
     if force_official:
         candidates = [OFFICIAL_URL.format(id=pd_id)]
         print("  -> Using official API (list metadata indicates restriction)", flush=True)
     else:
         candidates = [url.format(id=pd_id) for url in BYPASS_MIRRORS]
         candidates.append(OFFICIAL_URL.format(id=pd_id))
-
     last_error = None
     partial = local_path + ".part"
-
     for url in candidates:
         for attempt in range(2):
             try:
@@ -491,18 +530,15 @@ async def download_from_pixeldrain(pd_id: str, local_path: str,
                         if resp.status != 200:
                             last_error = f"HTTP {resp.status}"
                             break
-
                         # Start a clean partial file for each successful response.
                         try:
                             if os.path.exists(partial):
                                 os.remove(partial)
                         except OSError:
                             pass
-
                         async with aiofiles.open(partial, "wb") as f:
                             async for chunk in resp.content.iter_chunked(512 * 1024):
                                 await f.write(chunk)
-
                         if not os.path.exists(partial) or os.path.getsize(partial) == 0:
                             try:
                                 os.remove(partial)
@@ -510,15 +546,12 @@ async def download_from_pixeldrain(pd_id: str, local_path: str,
                                 pass
                             last_error = "Empty download"
                             break
-
                         os.replace(partial, local_path)
                         print(f"  Downloaded via {urlparse(url).netloc}", flush=True)
                         return True, None
-
             except Exception as exc:
                 last_error = str(exc)
                 break
-
     try:
         if os.path.exists(partial):
             os.remove(partial)
@@ -530,15 +563,12 @@ async def download_from_pixeldrain(pd_id: str, local_path: str,
 # ============================================================
 # SPLIT / TELEGRAM HELPERS
 # ============================================================
-
 def split_if_needed(path, max_size=MAX_TELEGRAM_SIZE):
     size = os.path.getsize(path)
     if size <= max_size:
         return [path]
-
     print(f"Splitting {os.path.basename(path)} ({size / 1024 / 1024:.1f} MB)", flush=True)
     base, ext = os.path.splitext(path)
-
     try:
         result = subprocess.run(
             [
@@ -550,15 +580,12 @@ def split_if_needed(path, max_size=MAX_TELEGRAM_SIZE):
         duration = float(result.stdout.strip())
     except Exception:
         duration = 0
-
     if duration <= 0:
         print("Could not determine media duration; cannot split this file.", flush=True)
         return [path]
-
     target_bytes = 1800 * 1024 * 1024
     segment_time = max(60, int((target_bytes / size) * duration))
     out_pattern = f"{base}_part%03d{ext}"
-
     subprocess.run(
         [
             "ffmpeg", "-y", "-i", path, "-c", "copy", "-map", "0",
@@ -567,7 +594,6 @@ def split_if_needed(path, max_size=MAX_TELEGRAM_SIZE):
         ],
         capture_output=True, text=True,
     )
-
     directory = os.path.dirname(path) or "."
     prefix = os.path.basename(base) + "_part"
     parts = sorted(
@@ -582,12 +608,10 @@ def split_if_needed(path, max_size=MAX_TELEGRAM_SIZE):
 async def create_or_get_topic(client, chat_id, topic_name, topic_cache):
     if topic_name in topic_cache:
         return topic_cache[topic_name]
-
     saved_id = get_saved_topic_id(chat_id, topic_name)
     if saved_id is not None:
         topic_cache[topic_name] = saved_id
         return saved_id
-
     try:
         forum = await client.get_entity(chat_id)
         result = await client(
@@ -643,7 +667,6 @@ async def upload_to_telegram(client, chat_id, topic_id, file_path, caption):
     try:
         file_handle = await fast_upload(client, file_path)
         ext = os.path.splitext(file_path)[1].lower()
-
         if ext in [".mp4", ".mkv", ".avi", ".mov", ".webm", ".m4v"]:
             duration = get_video_duration(file_path)
             thumb = generate_thumbnail(file_path)
@@ -686,29 +709,41 @@ async def upload_to_telegram(client, chat_id, topic_id, file_path, caption):
 # ============================================================
 # PROCESS ONE
 # ============================================================
-
 async def process_one(item, client, chat_id, topic_cache, semaphore):
     pd_id = item["pixeldrain_id"]
     filename = item["filename"]
     service = item["service"]
     username = item["username"]
     force_official = item.get("force_official", False)
-
     async with semaphore:
         prog = get_progress(username, pd_id)
         if SKIP_ALREADY_DONE_BY_THIS_TOOL and prog and prog[0] == "uploaded":
             print(f"Already done by this tool: {filename}", flush=True)
             return True
-
         safe_name = re.sub(r'[<>:"/\\\\|?*]', "_", filename)
         local_path = os.path.join(TEMP_DIR, f"{pd_id}_{safe_name}")
-
         print(f"\nDownloading: {filename} (Pixeldrain ID: {pd_id})", flush=True)
         mark_progress(username, pd_id, "pending", filename=filename, service=service)
 
+        # Try normal download first (exactly as before)
         ok, err = await download_from_pixeldrain(
             pd_id, local_path, force_official=force_official, filename=filename
         )
+
+        # If restricted → grab a temporary copy and feed *that* ID into the same download function
+        grabbed_id = None
+        if not ok and is_restricted_error(err):
+            print(f"  Restricted → grabbing temporary copy…", flush=True)
+            grabbed_id = await grab_file(pd_id)
+            if grabbed_id:
+                print(f"  Using temporary ID {grabbed_id} for download", flush=True)
+                ok, err = await download_from_pixeldrain(
+                    grabbed_id, local_path, force_official=True, filename=filename
+                )
+            # Always delete the temporary copy, success or failure
+            if grabbed_id:
+                await delete_file(grabbed_id)
+
         if not ok:
             print(f"Download failed: {err}", flush=True)
             mark_progress(
@@ -723,19 +758,16 @@ async def process_one(item, client, chat_id, topic_cache, semaphore):
             username, pd_id, "downloaded", filename=filename,
             service=service, local_path=local_path,
         )
-
         topic_id = await create_or_get_topic(
             client, chat_id, username, topic_cache
         )
         parts = split_if_needed(local_path)
         all_ok = True
-
         for index, part_path in enumerate(parts):
             part_name = os.path.basename(part_path)
             caption = f"#{service}_{username}\n{part_name}"
             if len(parts) > 1:
                 caption += f"\n(Part {index + 1}/{len(parts)})"
-
             print(f"Uploading: {part_name}", flush=True)
             ok = await upload_to_telegram(
                 client, chat_id, topic_id, part_path, caption
@@ -743,7 +775,6 @@ async def process_one(item, client, chat_id, topic_cache, semaphore):
             if not ok:
                 all_ok = False
                 break
-
         # Remove generated segments and the original temporary download.
         for part_path in parts:
             if part_path != local_path:
@@ -755,14 +786,12 @@ async def process_one(item, client, chat_id, topic_cache, semaphore):
             os.remove(local_path)
         except OSError:
             pass
-
         if all_ok:
             mark_progress(
                 username, pd_id, "uploaded",
                 filename=filename, service=service,
             )
             return True
-
         mark_progress(
             username, pd_id, "failed", filename=filename,
             service=service, error="telegram upload failed",
@@ -773,17 +802,13 @@ async def process_one(item, client, chat_id, topic_cache, semaphore):
 # ============================================================
 # BATCH MAIN — same startup/batch behavior as the Colab script
 # ============================================================
-
 async def main():
     validate_config()
-
     print("=" * 60, flush=True)
     print("Pixeldrain -> Telegram (Render migration)", flush=True)
     print("=" * 60, flush=True)
-
     files = []
     active_username = "unknown"
-
     if PIXELDRAIN_LIST_URL:
         print(f"Using Pixeldrain List: {PIXELDRAIN_LIST_URL}", flush=True)
         files, active_username = await load_from_pixeldrain_list(
@@ -798,31 +823,25 @@ async def main():
             active_username = files[0].get("username", "unknown")
     else:
         raise RuntimeError("Provide PIXELDRAIN_LIST_URL or SOURCE_DB_OR_JSON")
-
     init_progress_db(active_username)
     print_progress_summary(active_username)
     print(f"Total files available: {len(files)}", flush=True)
-
     if not files:
         print("Nothing to process.", flush=True)
         return
-
     if MAX_FILES_TO_PROCESS > 0:
         files = files[:MAX_FILES_TO_PROCESS]
         print(f"Limited to first {len(files)} file(s)", flush=True)
     else:
         print(f"No limit - processing all {len(files)} files", flush=True)
-
     client = TelegramClient(SESSION_FILE_NAME, api_id, api_hash)
     try:
         await client.start(bot_token=BOT_TOKEN)
         me = await client.get_me()
         print(f"Telegram connected: {me.first_name}", flush=True)
-
         topic_cache = {}
         semaphore = asyncio.Semaphore(DOWNLOAD_WORKERS)
         results = []
-
         # Kept sequential like the original script. DOWNLOAD_WORKERS controls
         # the semaphore limit, but the original loop itself processes one item
         # at a time; this avoids changing the working behavior.
@@ -831,10 +850,8 @@ async def main():
                 item, client, DESTINATION_CHAT_ID, topic_cache, semaphore
             )
             results.append(result)
-
         ok_count = sum(1 for result in results if result)
         fail_count = len(results) - ok_count
-
         print("\n" + "=" * 60, flush=True)
         print("BATCH DONE", flush=True)
         print(f"Success: {ok_count}", flush=True)
@@ -849,7 +866,6 @@ async def main():
 # ============================================================
 # RENDER HTTP HEALTH SERVER
 # ============================================================
-
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path in ("/", "/health"):
@@ -879,7 +895,6 @@ def start_health_server():
 
 async def service():
     start_health_server()
-
     # Start the batch exactly once per process start. If it fails, log the
     # exception but keep the HTTP service alive so Render can report health.
     async def run_batch():
@@ -888,9 +903,7 @@ async def service():
         except Exception as exc:
             print(f"FATAL batch error: {type(exc).__name__}: {exc}", flush=True)
             traceback.print_exc()
-
     asyncio.create_task(run_batch())
-
     # A Web Service must keep its process alive after the batch completes.
     await asyncio.Event().wait()
 
